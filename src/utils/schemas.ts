@@ -161,6 +161,48 @@ function validateAgainst(data: any, schema: any, path: string, root: any, issues
 	}
 }
 
+/**
+ * Depth-first search over the depends_on graph. Returns the offending path
+ * (e.g. ["a", "b", "a"]) for the first cycle found, or null when the graph is
+ * acyclic. Edges pointing at undeclared ids are ignored — those are already
+ * reported by the unknown-id check.
+ */
+function findDependencyCycle(steps: any[]): string[] | null {
+	const edges = new Map<string, string[]>();
+	for (const step of steps) {
+		if (!step || typeof step.id !== "string") continue;
+		const deps = Array.isArray(step.depends_on) ? step.depends_on.filter((d: any) => typeof d === "string") : [];
+		// Later duplicates of an id merge rather than overwrite, so no edge is lost.
+		edges.set(step.id, [...(edges.get(step.id) ?? []), ...deps]);
+	}
+
+	const done = new Set<string>();
+	const stack: string[] = [];
+	const onStack = new Set<string>();
+
+	function visit(id: string): string[] | null {
+		if (done.has(id)) return null;
+		if (onStack.has(id)) return [...stack.slice(stack.indexOf(id)), id];
+		onStack.add(id);
+		stack.push(id);
+		for (const dep of edges.get(id) ?? []) {
+			if (!edges.has(dep)) continue;
+			const found = visit(dep);
+			if (found) return found;
+		}
+		stack.pop();
+		onStack.delete(id);
+		done.add(id);
+		return null;
+	}
+
+	for (const id of edges.keys()) {
+		const found = visit(id);
+		if (found) return found;
+	}
+	return null;
+}
+
 export function validateWorkflow(yamlText: string): ValidationResult {
 	let parsed: unknown;
 	try {
@@ -197,6 +239,13 @@ export function validateWorkflow(yamlText: string): ValidationResult {
 				}
 			}
 		});
+
+		// Cross-field check: the depends_on graph must be acyclic. A self-reference
+		// or an A -> B -> A cycle would deadlock (or loop) at execution time.
+		const cycle = findDependencyCycle(data.steps);
+		if (cycle) {
+			issues.push({ path: "steps", message: `depends_on cycle detected: ${cycle.join(" -> ")}` });
+		}
 	}
 
 	if (issues.length === 0) {

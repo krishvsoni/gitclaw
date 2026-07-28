@@ -115,6 +115,65 @@ steps:
 	);
 });
 
+test("validateWorkflow flags a self-referencing depends_on", () => {
+	const yaml = `name: self-cycle
+description: step depends on itself
+steps:
+  - id: a
+    skill: gmail
+    prompt: fetch
+    depends_on: [a]
+`;
+	const r = validateWorkflow(yaml);
+	assert.equal(r.valid, false);
+	assert.ok(r.errors.some((e) => e.includes("cycle")), `errors: ${JSON.stringify(r.errors)}`);
+});
+
+test("validateWorkflow flags an A -> B -> A depends_on cycle", () => {
+	const yaml = `name: mutual-cycle
+description: two steps depend on each other
+steps:
+  - id: a
+    skill: gmail
+    prompt: fetch
+    depends_on: [b]
+  - id: b
+    skill: slack
+    prompt: post
+    depends_on: [a]
+`;
+	const r = validateWorkflow(yaml);
+	assert.equal(r.valid, false);
+	assert.ok(
+		r.errors.some((e) => e.includes("depends_on cycle detected")),
+		`errors: ${JSON.stringify(r.errors)}`,
+	);
+});
+
+test("validateWorkflow accepts a diamond-shaped depends_on graph", () => {
+	const yaml = `name: diamond-flow
+description: fan out then fan in
+steps:
+  - id: root
+    skill: gmail
+    prompt: fetch
+  - id: left
+    skill: summarize
+    prompt: summarize inbox
+    depends_on: [root]
+  - id: right
+    skill: summarize
+    prompt: summarize archive
+    depends_on: [root]
+  - id: post
+    skill: slack
+    prompt: post both summaries
+    depends_on: [left, right]
+`;
+	const r = validateWorkflow(yaml);
+	assert.equal(r.valid, true, `errors: ${JSON.stringify(r.errors)}`);
+});
+
 test("validateWorkflow accepts approval step with requires_approval", () => {
 	const yaml = `name: approval-flow
 description: needs sign-off

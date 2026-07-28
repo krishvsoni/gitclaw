@@ -1,5 +1,6 @@
+import { existsSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
-import { join, resolve } from "path";
+import { join, resolve, sep } from "path";
 import { discoverSkills } from "../skills.js";
 import { validateWorkflow } from "../utils/schemas.js";
 import { generateWorkflow, type LlmClient } from "../utils/workflow-generator.js";
@@ -11,6 +12,7 @@ interface GenerateFlags {
 	model?: string;
 	apiKey?: string;
 	dryRun: boolean;
+	force?: boolean;
 }
 
 const RED = (s: string) => `\x1b[31m${s}\x1b[0m`;
@@ -30,15 +32,30 @@ Options:
   -d, --dir <path>        Agent directory (default: current directory)
   -p, --prompt <text>     Natural-language description of the workflow (required)
       --refine <file>     Refine an existing workflow YAML by applying --prompt as an instruction
+                          (must be a path inside the agent directory)
   -m, --model <spec>      LLM model in provider:model form (default: openai:gpt-4o)
       --api-key <key>     API key for the provider (falls back to OPENAI_API_KEY or <PROVIDER>_API_KEY)
       --dry-run           Print the generated YAML to stdout instead of writing a file
+  -f, --force             Overwrite workflows/<name>.yaml if it already exists
+                          (without this flag an existing file is never replaced)
   -h, --help              Show this help message
 
 Examples:
   gitagent workflow generate -p "every morning summarize unread emails and post to Slack"
   gitagent workflow generate -p "add a human approval step before the Slack post" --refine workflows/morning-digest.yaml
 `);
+}
+
+// Reads the value that follows a flag, erroring out when the flag is the last
+// token. Without this, argv[++i] yields undefined and the failure surfaces far
+// from the parse site (e.g. resolve(undefined) throwing a bare TypeError).
+function valueFor(argv: string[], i: number, flag: string): string {
+	const v = argv[i + 1];
+	if (v === undefined) {
+		console.error(RED(`${flag} requires a value`));
+		process.exit(2);
+	}
+	return v;
 }
 
 function parseFlags(argv: string[]): GenerateFlags {
@@ -48,24 +65,28 @@ function parseFlags(argv: string[]): GenerateFlags {
 		switch (a) {
 			case "-d":
 			case "--dir":
-				flags.dir = argv[++i];
+				flags.dir = valueFor(argv, i++, a);
 				break;
 			case "-p":
 			case "--prompt":
-				flags.prompt = argv[++i];
+				flags.prompt = valueFor(argv, i++, a);
 				break;
 			case "--refine":
-				flags.refine = argv[++i];
+				flags.refine = valueFor(argv, i++, a);
 				break;
 			case "-m":
 			case "--model":
-				flags.model = argv[++i];
+				flags.model = valueFor(argv, i++, a);
 				break;
 			case "--api-key":
-				flags.apiKey = argv[++i];
+				flags.apiKey = valueFor(argv, i++, a);
 				break;
 			case "--dry-run":
 				flags.dryRun = true;
+				break;
+			case "-f":
+			case "--force":
+				flags.force = true;
 				break;
 			case "-h":
 			case "--help":
@@ -110,7 +131,13 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<{ filePath?
 
 	let previousWorkflow: string | undefined;
 	if (flags.refine) {
+		// resolve() ignores the base when the second argument is absolute, so an
+		// absolute path or a ../ traversal would otherwise read (and ship to the
+		// LLM) any file on disk. Keep --refine inside the agent directory.
 		const refinePath = resolve(agentDir, flags.refine);
+		if (refinePath !== agentDir && !refinePath.startsWith(agentDir + sep)) {
+			throw new Error(`--refine path must be inside the agent directory: ${refinePath}`);
+		}
 		previousWorkflow = await readFile(refinePath, "utf-8");
 	}
 
@@ -158,8 +185,13 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<{ filePath?
 	const validated = validateWorkflow(yaml).data!;
 	const slug = slugify(validated.name);
 	const workflowsDir = join(agentDir, "workflows");
-	await mkdir(workflowsDir, { recursive: true });
 	const filePath = join(workflowsDir, `${slug}.yaml`);
+	if (!flags.force && existsSync(filePath)) {
+		throw new Error(
+			`${filePath} already exists. Re-run with --force to overwrite it, or use --dry-run to preview the generated workflow.`,
+		);
+	}
+	await mkdir(workflowsDir, { recursive: true });
 	await writeFile(filePath, yaml.endsWith("\n") ? yaml : yaml + "\n", "utf-8");
 	console.error(GREEN(`\nWrote workflow to ${filePath}`));
 	return { filePath, yaml };

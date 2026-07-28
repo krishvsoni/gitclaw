@@ -100,6 +100,23 @@ test("stripCodeFences leaves unfenced YAML alone", () => {
 	assert.equal(stripCodeFences(input), "name: foo");
 });
 
+test("stripCodeFences extracts the block when the LLM wraps it in prose", () => {
+	const input = [
+		"Here is your workflow:",
+		"",
+		"```yaml",
+		VALID_YAML.trimEnd(),
+		"```",
+		"",
+		"Let me know if you want an approval step added!",
+	].join("\n");
+	const out = stripCodeFences(input);
+	assert.equal(out.startsWith("name: morning-digest"), true, out);
+	assert.equal(out.includes("Here is your workflow"), false, out);
+	assert.equal(out.includes("Let me know"), false, out);
+	assert.equal(out.includes("```"), false, out);
+});
+
 // ── generateWorkflow with an injected LLM ──────────────────────────────
 
 test("generateWorkflow returns the LLM output after stripping fences", async () => {
@@ -187,6 +204,42 @@ test("runGenerate gives up after MAX_RETRIES and throws", async () => {
 			/Validation failed after retries/,
 		);
 		assert.equal(calls, 3); // 1 initial + 2 retries
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("runGenerate refuses to overwrite an existing workflow unless --force is passed", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gitagent-test-"));
+	try {
+		const llm: LlmClient = async () => VALID_YAML;
+		const first = await runGenerate({ flags: { dir, prompt: "x", dryRun: false }, llm });
+		assert.ok(first.filePath);
+
+		await assert.rejects(
+			() => runGenerate({ flags: { dir, prompt: "x", dryRun: false }, llm }),
+			/already exists/,
+		);
+
+		const forced = await runGenerate({ flags: { dir, prompt: "x", dryRun: false, force: true }, llm });
+		assert.equal(forced.filePath, first.filePath);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("runGenerate rejects a --refine path outside the agent directory", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gitagent-test-"));
+	try {
+		const llm: LlmClient = async () => VALID_YAML;
+		await assert.rejects(
+			() => runGenerate({ flags: { dir, prompt: "x", refine: "/etc/hostname", dryRun: true }, llm }),
+			/must be inside the agent directory/,
+		);
+		await assert.rejects(
+			() => runGenerate({ flags: { dir, prompt: "x", refine: "../../etc/hostname", dryRun: true }, llm }),
+			/must be inside the agent directory/,
+		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

@@ -117,11 +117,15 @@ export function buildMessages(opts: GenerateWorkflowOptions): LlmMessage[] {
 	return messages;
 }
 
-const FENCE_RE = /^\s*```(?:ya?ml)?\s*\n([\s\S]*?)\n```\s*$/i;
+// Pull the first fenced block out of the response regardless of any surrounding
+// commentary ("Here is your workflow: ```yaml ... ``` Let me know if..."). An
+// anchored match would leave the prose in place and burn a retry on a YAML
+// parse error. Falls back to the raw trimmed text when there is no fence.
+const FENCE_INNER_RE = /```(?:ya?ml)?[ \t]*\r?\n([\s\S]*?)\r?\n?```/i;
 
 export function stripCodeFences(raw: string): string {
-	const m = raw.match(FENCE_RE);
-	return m ? m[1] : raw.trim();
+	const m = raw.match(FENCE_INNER_RE);
+	return m ? m[1].trim() : raw.trim();
 }
 
 async function defaultLlmClient(messages: LlmMessage[], opts: LlmCallOptions): Promise<string> {
@@ -142,10 +146,12 @@ async function defaultLlmClient(messages: LlmMessage[], opts: LlmCallOptions): P
 		);
 	}
 
-	const [{ getModel }, { Agent }] = await Promise.all([
-		import("@mariozechner/pi-ai" as any) as Promise<any>,
-		import("@mariozechner/pi-agent-core" as any) as Promise<any>,
+	const [piAi, piAgentCore] = await Promise.all([
+		import("@mariozechner/pi-ai") as Promise<any>,
+		import("@mariozechner/pi-agent-core") as Promise<any>,
 	]);
+	const { getModel } = piAi;
+	const { Agent } = piAgentCore;
 
 	if (!process.env[`${provider.toUpperCase()}_API_KEY`]) {
 		process.env[`${provider.toUpperCase()}_API_KEY`] = apiKey;
