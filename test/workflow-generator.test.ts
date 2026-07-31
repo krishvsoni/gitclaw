@@ -166,7 +166,7 @@ test("runGenerate retries when validation fails, then writes the file when the s
 		});
 		assert.equal(calls, 2);
 		assert.ok(result.filePath, "expected a written file path");
-		assert.equal(result.filePath!.endsWith("workflows/morning-digest.yaml"), true);
+		assert.equal(result.filePath!.endsWith(join("workflows", "morning-digest.yaml")), true, result.filePath);
 		const written = await readFile(result.filePath!, "utf-8");
 		assert.ok(written.includes("name: morning-digest"));
 	} finally {
@@ -243,6 +243,133 @@ test("runGenerate rejects a --refine path outside the agent directory", async ()
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
+});
+
+// ── Installed-skill cross-check ────────────────────────────────────────
+
+const UNKNOWN_SKILL_YAML = `name: morning-weather-summary
+description: Check the weather each morning and send a text summary.
+steps:
+  - id: fetch_weather
+    skill: weather
+    prompt: Fetch today's forecast.
+  - id: send_summary
+    skill: sms
+    prompt: Text a one-sentence summary.
+    depends_on: [fetch_weather]
+`;
+
+// Materializes real skills/<name>/SKILL.md files so discoverSkills() finds them.
+async function withInstalledSkills(names: string[], fn: (dir: string) => Promise<void>): Promise<void> {
+	const { mkdir, writeFile } = await import("node:fs/promises");
+	const dir = await mkdtemp(join(tmpdir(), "gitagent-skills-"));
+	try {
+		for (const name of names) {
+			await mkdir(join(dir, "skills", name), { recursive: true });
+			await writeFile(
+				join(dir, "skills", name, "SKILL.md"),
+				`---\nname: ${name}\ndescription: Test skill ${name}\n---\n\nDo ${name} things.\n`,
+				"utf-8",
+			);
+		}
+		await fn(dir);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+}
+
+test("runGenerate retries when a step names a skill that is not installed", async () => {
+	await withInstalledSkills(["gmail", "slack", "summarize"], async (dir) => {
+		let calls = 0;
+		let retryPrompt = "";
+		const llm: LlmClient = async (messages) => {
+			calls++;
+			if (calls === 1) return UNKNOWN_SKILL_YAML;
+			retryPrompt = messages[messages.length - 1].content;
+			return VALID_YAML;
+		};
+		const result = await runGenerate({ flags: { dir, prompt: "text me the weather", dryRun: true }, llm });
+		assert.equal(calls, 2);
+		assert.ok(retryPrompt.includes('"weather" is not an installed skill'), retryPrompt);
+		assert.ok(retryPrompt.includes('"sms" is not an installed skill'), retryPrompt);
+		assert.ok(result.yaml.includes("name: morning-digest"));
+	});
+});
+
+test("runGenerate fails rather than writing a workflow that references missing skills", async () => {
+	await withInstalledSkills(["gmail", "slack", "summarize"], async (dir) => {
+		const llm: LlmClient = async () => UNKNOWN_SKILL_YAML;
+		await assert.rejects(
+			() => runGenerate({ flags: { dir, prompt: "text me the weather", dryRun: false }, llm }),
+			/Validation failed after retries/,
+		);
+		await assert.rejects(() => readFile(join(dir, "workflows", "morning-weather-summary.yaml"), "utf-8"));
+	});
+});
+
+test("runGenerate --allow-missing-skills writes the workflow anyway", async () => {
+	await withInstalledSkills(["gmail", "slack", "summarize"], async (dir) => {
+		let calls = 0;
+		const llm: LlmClient = async () => {
+			calls++;
+			return UNKNOWN_SKILL_YAML;
+		};
+		const result = await runGenerate({
+			flags: { dir, prompt: "text me the weather", dryRun: false, allowMissingSkills: true },
+			llm,
+		});
+		assert.equal(calls, 1, "should not retry when the check is disabled");
+		assert.ok(result.filePath);
+		const written = await readFile(result.filePath!, "utf-8");
+		assert.ok(written.includes("skill: weather"));
+	});
+});
+
+test("runGenerate skips the skill check when no skills are installed", async () => {
+	// An agent dir with no skills/ folder is the documented escape hatch: the
+	// system prompt tells the model to invent sensible names, so rejecting them
+	// here would make generation impossible on a fresh project.
+	const dir = await mkdtemp(join(tmpdir(), "gitagent-test-"));
+	try {
+		let calls = 0;
+		const llm: LlmClient = async () => {
+			calls++;
+			return UNKNOWN_SKILL_YAML;
+		};
+		const result = await runGenerate({ flags: { dir, prompt: "text me the weather", dryRun: true }, llm });
+		assert.equal(calls, 1);
+		assert.ok(result.yaml.includes("skill: weather"));
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("approval is accepted as a pseudo-skill even though it is not installed", async () => {
+	await withInstalledSkills(["analytics", "email"], async (dir) => {
+		const approvalYaml = `name: daily-sales-report
+description: Pull sales data, require approval, then send.
+steps:
+  - id: pull_data
+    skill: analytics
+    prompt: Pull yesterday's totals.
+  - id: approve
+    skill: approval
+    prompt: Review the data before it goes out.
+    requires_approval: true
+    depends_on: [pull_data]
+  - skill: email
+    prompt: Send the approved report.
+    depends_on: [approve]
+`;
+		let calls = 0;
+		const llm: LlmClient = async () => {
+			calls++;
+			return approvalYaml;
+		};
+		const result = await runGenerate({ flags: { dir, prompt: "sales report with sign-off", dryRun: true }, llm });
+		assert.equal(calls, 1, "approval step should not trigger a retry");
+		assert.ok(result.yaml.includes("skill: approval"));
+	});
 });
 
 test("runGenerate refine mode reads previous YAML and passes it to the LLM", async () => {

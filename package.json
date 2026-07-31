@@ -22,6 +22,7 @@
     "dist",
     "!dist/voice",
     "!dist/composio",
+    "spec",
     "README.md",
     "LICENSE"
   ],

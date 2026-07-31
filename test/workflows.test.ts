@@ -94,6 +94,27 @@ steps:
 	});
 });
 
+test("loadFlowDefinition still accepts the legacy single full-path argument", async () => {
+	await withAgentDir({ "morning-digest.yaml": VALID_FLOW }, async (dir) => {
+		const legacyPath = join(dir, "workflows", "morning-digest.yaml");
+		const flow = await loadFlowDefinition(legacyPath);
+		assert.equal(flow.name, "morning-digest");
+		assert.equal(flow.steps.length, 2);
+	});
+});
+
+test("loadFlowDefinition does not read workflows/undefined.yaml when the name is omitted", async () => {
+	await withAgentDir({ "morning-digest.yaml": VALID_FLOW }, async (dir) => {
+		// The legacy form treats the lone argument as a file path, so an agent dir
+		// passed alone must fail as a missing file rather than silently looking for
+		// a flow literally named "undefined".
+		await assert.rejects(() => loadFlowDefinition(dir), (err: any) => {
+			assert.ok(!String(err.message).includes("undefined"), err.message);
+			return true;
+		});
+	});
+});
+
 test("loadFlowDefinition rejects depends_on that does not name a preceding step", async () => {
 	const forward = `name: forward-dep
 description: depends on a later step

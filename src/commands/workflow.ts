@@ -2,7 +2,7 @@ import { existsSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join, resolve, sep } from "path";
 import { discoverSkills } from "../skills.js";
-import { validateWorkflow } from "../utils/schemas.js";
+import { validateSkillReferences, validateWorkflow } from "../utils/schemas.js";
 import { generateWorkflow, type LlmClient } from "../utils/workflow-generator.js";
 
 interface GenerateFlags {
@@ -13,6 +13,7 @@ interface GenerateFlags {
 	apiKey?: string;
 	dryRun: boolean;
 	force?: boolean;
+	allowMissingSkills?: boolean;
 }
 
 const RED = (s: string) => `\x1b[31m${s}\x1b[0m`;
@@ -38,6 +39,10 @@ Options:
       --dry-run           Print the generated YAML to stdout instead of writing a file
   -f, --force             Overwrite workflows/<name>.yaml if it already exists
                           (without this flag an existing file is never replaced)
+      --allow-missing-skills
+                          Accept steps that reference skills which are not installed
+                          (by default generation fails rather than writing a workflow
+                          that cannot run)
   -h, --help              Show this help message
 
 Examples:
@@ -88,6 +93,9 @@ function parseFlags(argv: string[]): GenerateFlags {
 			case "--force":
 				flags.force = true;
 				break;
+			case "--allow-missing-skills":
+				flags.allowMissingSkills = true;
+				break;
 			case "-h":
 			case "--help":
 				printHelp();
@@ -128,6 +136,7 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<{ filePath?
 
 	const agentDir = resolve(flags.dir);
 	const skills = await discoverSkills(agentDir);
+	const skillNames = skills.map((s) => s.name);
 
 	let previousWorkflow: string | undefined;
 	if (flags.refine) {
@@ -156,21 +165,35 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<{ filePath?
 			llm: opts.llm,
 		});
 		const result = validateWorkflow(yaml);
-		if (result.valid) {
+		// A schema-valid workflow can still name skills that aren't installed,
+		// which would only surface as a run-time failure. Fold that into the same
+		// retry loop so the model gets a chance to pick real skills.
+		const skillErrors = result.valid && !flags.allowMissingSkills
+			? validateSkillReferences(result.data!, skillNames)
+			: [];
+		if (result.valid && skillErrors.length === 0) {
 			lastErrors = [];
 			break;
 		}
-		lastErrors = result.errors;
+		lastErrors = [...result.errors, ...skillErrors];
 		if (attempt < MAX_RETRIES) {
 			promptForLlm =
-				`${flags.prompt.trim()}\n\nThe previous attempt failed schema validation. Fix these errors and return the full YAML again:\n` +
-				result.errors.map((e) => `- ${e}`).join("\n");
+				`${flags.prompt.trim()}\n\nThe previous attempt failed schema validation or referenced skills that are not installed. Fix these errors and return the full YAML again:\n` +
+				lastErrors.map((e) => `- ${e}`).join("\n");
 		}
 	}
 
 	if (lastErrors.length > 0) {
 		console.error(RED("\nWorkflow validation failed after retries:"));
 		for (const e of lastErrors) console.error(RED(`  - ${e}`));
+		if (lastErrors.some((e) => e.includes("is not an installed skill"))) {
+			console.error(DIM(`\nInstalled skills: ${skillNames.join(", ") || "(none)"}`));
+			console.error(
+				DIM(
+					"Create the missing skill(s) under skills/ first, or re-run with --allow-missing-skills to write the workflow anyway.",
+				),
+			);
+		}
 		console.error(DIM("\nLast generated YAML:\n"));
 		console.error(yaml);
 		throw new Error("Validation failed after retries");

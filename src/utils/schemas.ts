@@ -203,6 +203,37 @@ function findDependencyCycle(steps: any[]): string[] | null {
 	return null;
 }
 
+/**
+ * Pseudo-skill for human-approval steps. It never exists under `skills/`, so it
+ * has to be exempt from the installed-skill check below.
+ */
+export const APPROVAL_SKILL = "approval";
+
+/**
+ * Cross-check every step's `skill` against the skills actually installed in the
+ * agent directory. The JSON Schema can only check shape, so without this a
+ * plausible-looking workflow referencing skills that don't exist is written to
+ * disk and fails at run time instead of at generation time.
+ *
+ * Returns validator-shaped error strings so callers can fold them into the same
+ * retry loop as schema errors. An empty `installedSkills` list disables the
+ * check — that is the same escape hatch the generator's system prompt takes,
+ * where the model is told to invent sensible skill names.
+ */
+export function validateSkillReferences(workflow: WorkflowDef, installedSkills: string[]): string[] {
+	if (installedSkills.length === 0) return [];
+	const known = new Set([...installedSkills, APPROVAL_SKILL]);
+	const errors: string[] = [];
+	const steps = Array.isArray(workflow?.steps) ? workflow.steps : [];
+	steps.forEach((step: any, i: number) => {
+		const skill = typeof step?.skill === "string" ? step.skill.trim() : "";
+		if (skill && !known.has(skill)) {
+			errors.push(`steps[${i}].skill: "${skill}" is not an installed skill`);
+		}
+	});
+	return errors;
+}
+
 export function validateWorkflow(yamlText: string): ValidationResult {
 	let parsed: unknown;
 	try {

@@ -3,7 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { validateWorkflow, loadWorkflowSchema } from "../src/utils/schemas.ts";
+import { validateWorkflow, loadWorkflowSchema, validateSkillReferences } from "../src/utils/schemas.ts";
 
 const VALID_YAML = `name: morning-digest
 description: Summarize unread emails and post to Slack each morning.
@@ -209,4 +209,49 @@ test("validateWorkflow rejects empty document", () => {
 	const r = validateWorkflow("");
 	assert.equal(r.valid, false);
 	assert.ok(r.errors[0].includes("empty"));
+});
+
+// ── validateSkillReferences ────────────────────────────────────────────
+
+const UNKNOWN_SKILLS_YAML = `name: morning-weather-summary
+description: Check the weather each morning and send a text summary.
+steps:
+  - id: fetch_weather
+    skill: weather
+    prompt: Fetch today's forecast.
+  - id: send_summary
+    skill: sms
+    prompt: Text a one-sentence summary.
+    depends_on: [fetch_weather]
+`;
+
+test("validateSkillReferences reports every step naming an uninstalled skill", () => {
+	const data = validateWorkflow(UNKNOWN_SKILLS_YAML).data!;
+	const errors = validateSkillReferences(data, ["gmail", "slack", "summarize"]);
+	assert.deepEqual(errors, [
+		'steps[0].skill: "weather" is not an installed skill',
+		'steps[1].skill: "sms" is not an installed skill',
+	]);
+});
+
+test("validateSkillReferences passes when every skill is installed", () => {
+	const data = validateWorkflow(VALID_YAML).data!;
+	assert.deepEqual(validateSkillReferences(data, ["gmail", "slack", "summarize"]), []);
+});
+
+test("validateSkillReferences exempts the approval pseudo-skill", () => {
+	const yaml = `name: with-approval
+description: Approval step uses a pseudo-skill.
+steps:
+  - skill: approval
+    prompt: Sign off before sending.
+    requires_approval: true
+`;
+	const data = validateWorkflow(yaml).data!;
+	assert.deepEqual(validateSkillReferences(data, ["gmail"]), []);
+});
+
+test("validateSkillReferences is a no-op when no skills are installed", () => {
+	const data = validateWorkflow(UNKNOWN_SKILLS_YAML).data!;
+	assert.deepEqual(validateSkillReferences(data, []), []);
 });

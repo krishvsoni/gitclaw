@@ -32,6 +32,7 @@ const SYSTEM_RULES = `Rules (MUST follow):
 - The output MUST validate against the schema above.
 - "name" must be kebab-case (lowercase letters, digits, and single hyphens).
 - Every step "skill" must reference an installed skill from the list below, unless the step is human approval — in that case use skill: "approval" and set requires_approval: true.
+- Never invent a skill name. Steps naming a skill that is not installed are rejected, so express the request using the installed skills even if that means fewer steps.
 - When multiple steps need ordering beyond top-to-bottom, give them snake_case "id" values and use "depends_on" to express the dependency.
 - Keep "prompt" fields concrete and self-contained — a downstream agent will read them verbatim.
 - Do not invent fields not in the schema.`;

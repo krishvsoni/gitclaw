@@ -118,6 +118,8 @@ export async function discoverWorkflows(agentDir: string): Promise<WorkflowMetad
 	return workflows.sort((a, b) => a.name.localeCompare(b.name));
 }
 
+let warnedLegacyFlowPath = false;
+
 /**
  * Load a flow by name from `<agentDir>/workflows/<flowName>.yaml`.
  *
@@ -125,11 +127,35 @@ export async function discoverWorkflows(agentDir: string): Promise<WorkflowMetad
  * owns its own safety: `flowName` must be kebab-case, which rules out traversal
  * segments and absolute paths no matter how the name reached this code.
  */
-export async function loadFlowDefinition(agentDir: string, flowName: string): Promise<SkillFlowDefinition> {
-	if (!KEBAB_RE.test(flowName)) {
-		throw new Error(`Invalid flow name "${flowName}": must be kebab-case (e.g. my-flow-name)`);
+export async function loadFlowDefinition(agentDir: string, flowName: string): Promise<SkillFlowDefinition>;
+/**
+ * Legacy single-argument form, kept so callers written against the previous
+ * signature (e.g. `@open-gitagent/voice`) keep working. It reads the path as
+ * given and therefore provides no containment — migrate to
+ * `loadFlowDefinition(agentDir, flowName)`.
+ *
+ * @deprecated Pass `(agentDir, flowName)` instead.
+ */
+export async function loadFlowDefinition(filePath: string): Promise<SkillFlowDefinition>;
+export async function loadFlowDefinition(agentDirOrPath: string, flowName?: string): Promise<SkillFlowDefinition> {
+	// Which form was used is decided by arity, not by inspecting the string: a
+	// missing second argument would otherwise stringify to "undefined", which
+	// passes KEBAB_RE and fails later as a confusing ENOENT.
+	let filePath: string;
+	if (flowName === undefined) {
+		if (!warnedLegacyFlowPath) {
+			warnedLegacyFlowPath = true;
+			console.warn(
+				"[gitagent] loadFlowDefinition(filePath) is deprecated — call loadFlowDefinition(agentDir, flowName) so the path is validated and built internally.",
+			);
+		}
+		filePath = agentDirOrPath;
+	} else {
+		if (!KEBAB_RE.test(flowName)) {
+			throw new Error(`Invalid flow name "${flowName}": must be kebab-case (e.g. my-flow-name)`);
+		}
+		filePath = join(agentDirOrPath, "workflows", `${flowName}.yaml`);
 	}
-	const filePath = join(agentDir, "workflows", `${flowName}.yaml`);
 	const raw = await readFile(filePath, "utf-8");
 	const data = yaml.load(raw);
 
