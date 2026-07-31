@@ -150,6 +150,28 @@ steps:
 	);
 });
 
+test("validateWorkflow rejects a forward depends_on reference", () => {
+	// Steps run in declaration order, so depending on a later step can never be
+	// satisfied. Catching it here keeps validate in step with loadFlowDefinition
+	// and gives the retry loop a chance to fix it before anything is written.
+	const yaml = `name: forward-ref
+description: first step depends on the second
+steps:
+  - skill: gmail
+    prompt: fetch
+    depends_on: [post]
+  - id: post
+    skill: slack
+    prompt: post
+`;
+	const r = validateWorkflow(yaml);
+	assert.equal(r.valid, false);
+	assert.ok(
+		r.errors.some((e) => e.includes('references unknown step id "post"') && e.includes("preceding step")),
+		`errors: ${JSON.stringify(r.errors)}`,
+	);
+});
+
 test("validateWorkflow accepts a diamond-shaped depends_on graph", () => {
 	const yaml = `name: diamond-flow
 description: fan out then fan in

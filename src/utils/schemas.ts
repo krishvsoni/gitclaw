@@ -254,21 +254,26 @@ export function validateWorkflow(yamlText: string): ValidationResult {
 	const issues: Issue[] = [];
 	validateAgainst(parsed, schema, "", schema, issues);
 
-	// Cross-field check: depends_on ids must reference declared step ids
+	// Cross-field check: depends_on ids must reference a step declared earlier.
+	// The set grows as steps are visited rather than being pre-built, so a forward
+	// reference is rejected here instead of passing validation and failing later in
+	// loadFlowDefinition — after the file is already on disk and out of the retry
+	// loop. Steps execute in declaration order, so these are the same semantics.
 	const data = parsed as any;
 	if (Array.isArray(data.steps)) {
-		const declared = new Set<string>();
-		for (const step of data.steps) {
-			if (step && typeof step.id === "string") declared.add(step.id);
-		}
+		const available = new Set<string>();
 		data.steps.forEach((step: any, i: number) => {
 			if (step && Array.isArray(step.depends_on)) {
 				for (const dep of step.depends_on) {
-					if (typeof dep === "string" && !declared.has(dep)) {
-						issues.push({ path: `steps[${i}].depends_on`, message: `references unknown step id "${dep}"` });
+					if (typeof dep === "string" && !available.has(dep)) {
+						issues.push({
+							path: `steps[${i}].depends_on`,
+							message: `references unknown step id "${dep}" (must be declared in a preceding step)`,
+						});
 					}
 				}
 			}
+			if (step && typeof step.id === "string") available.add(step.id);
 		});
 
 		// Cross-field check: the depends_on graph must be acyclic. A self-reference
