@@ -16,6 +16,12 @@ import {
 	type LlmMessage,
 } from "../src/utils/workflow-generator.ts";
 import { runGenerate } from "../src/commands/workflow.ts";
+import { parseUnsupportedReport } from "../src/utils/schemas.ts";
+import {
+	buildFitnessPrompt,
+	checkSkillFitness,
+	parseFitnessResponse,
+} from "../src/utils/skill-fitness.ts";
 import type { SkillMetadata } from "../src/skills.ts";
 
 const SKILLS: SkillMetadata[] = [
@@ -288,7 +294,12 @@ test("runGenerate retries when a step names a skill that is not installed", asyn
 			retryPrompt = messages[messages.length - 1].content;
 			return VALID_YAML;
 		};
-		const result = await runGenerate({ flags: { dir, prompt: "text me the weather", dryRun: true }, llm });
+		const result = await runGenerate({
+			flags: { dir, prompt: "text me the weather", dryRun: true },
+			llm,
+			// Isolated so `calls` counts generation attempts only.
+			fitnessLlm: async () => "[]",
+		});
 		assert.equal(calls, 2);
 		assert.ok(retryPrompt.includes('"weather" is not an installed skill'), retryPrompt);
 		assert.ok(retryPrompt.includes('"sms" is not an installed skill'), retryPrompt);
@@ -366,9 +377,238 @@ steps:
 			calls++;
 			return approvalYaml;
 		};
-		const result = await runGenerate({ flags: { dir, prompt: "sales report with sign-off", dryRun: true }, llm });
+		const result = await runGenerate({
+			flags: { dir, prompt: "sales report with sign-off", dryRun: true },
+			llm,
+			fitnessLlm: async () => "[]",
+		});
 		assert.equal(calls, 1, "approval step should not trigger a retry");
 		assert.ok(result.yaml.includes("skill: approval"));
+	});
+});
+
+// ── Unsupported-request escape hatch ───────────────────────────────────
+
+test("buildSystemPrompt documents the unsupported form and no longer tells the model to force a fit", () => {
+	const sys = buildSystemPrompt(SKILLS);
+	assert.ok(sys.includes("unsupported:"), "system prompt missing the unsupported escape hatch");
+	assert.ok(
+		!sys.includes("even if that means fewer steps"),
+		"system prompt still pressures the model to map onto installed skills at any cost",
+	);
+	assert.ok(sys.includes("worse than no workflow"), "system prompt missing the wrong-skill warning");
+});
+
+test("parseUnsupportedReport recognises a decline and trims its items", () => {
+	const items = parseUnsupportedReport(
+		"unsupported:\n  - fetch the current weather forecast  \n  - send a text message\n",
+	);
+	assert.deepEqual(items, ["fetch the current weather forecast", "send a text message"]);
+});
+
+test("parseUnsupportedReport accepts a bare scalar", () => {
+	assert.deepEqual(parseUnsupportedReport("unsupported: send a text message\n"), ["send a text message"]);
+});
+
+test("parseUnsupportedReport returns null for a normal workflow, an empty list, and junk", () => {
+	assert.equal(parseUnsupportedReport(VALID_YAML), null);
+	assert.equal(parseUnsupportedReport("unsupported: []\n"), null);
+	assert.equal(parseUnsupportedReport("unsupported:\n  - ''\n  - '   '\n"), null);
+	assert.equal(parseUnsupportedReport("- just\n- a\n- list\n"), null);
+	assert.equal(parseUnsupportedReport("::: not yaml :::\n  - [\n"), null);
+});
+
+test("runGenerate stops without retrying when the model declines the request", async () => {
+	await withInstalledSkills(["gmail", "slack", "internal-comms"], async (dir) => {
+		let calls = 0;
+		const llm: LlmClient = async () => {
+			calls++;
+			return "unsupported:\n  - fetch the current weather forecast\n  - send a text message\n";
+		};
+		await assert.rejects(
+			() => runGenerate({ flags: { dir, prompt: "text me the weather each morning", dryRun: false }, llm }),
+			/No installed skill covers part of the request/,
+		);
+		// Retrying a decline is what produced the wrong-skill substitution it replaces.
+		assert.equal(calls, 1, "a decline must not be retried");
+		await assert.rejects(() => readFile(join(dir, "workflows", "morning-weather-summary.yaml"), "utf-8"));
+	});
+});
+
+test("runGenerate declines even when the model also emits a plausible workflow", async () => {
+	await withInstalledSkills(["gmail", "slack", "summarize"], async (dir) => {
+		const llm: LlmClient = async () => `${VALID_YAML}unsupported:\n  - send a text message\n`;
+		await assert.rejects(
+			() => runGenerate({ flags: { dir, prompt: "text me the digest", dryRun: true }, llm }),
+			/No installed skill covers part of the request/,
+		);
+	});
+});
+
+// ── Advisory skill-fitness check ───────────────────────────────────────
+
+const FITNESS_SKILLS: SkillMetadata[] = [
+	{
+		name: "internal-comms",
+		description: "Draft and publish company-wide announcements to staff.",
+		directory: "/x/skills/internal-comms",
+		filePath: "/x/skills/internal-comms/SKILL.md",
+	},
+	{ name: "slack", description: "Post messages to Slack", directory: "/x/skills/slack", filePath: "/x/skills/slack/SKILL.md" },
+];
+
+const MISFIT_WORKFLOW = {
+	name: "morning-weather-briefing",
+	description: "Send a weather briefing each morning.",
+	steps: [
+		{ skill: "internal-comms", prompt: "Write a concise morning weather briefing for today's forecast." },
+		{ skill: "slack", prompt: "Post the briefing." },
+	],
+};
+
+test("buildFitnessPrompt pairs each step with the chosen skill's description", () => {
+	const prompt = buildFitnessPrompt(MISFIT_WORKFLOW as any, FITNESS_SKILLS);
+	assert.ok(prompt.includes("step 0:"), prompt);
+	assert.ok(prompt.includes("skill: internal-comms"), prompt);
+	assert.ok(prompt.includes("Draft and publish company-wide announcements"), prompt);
+	assert.ok(prompt.includes("morning weather briefing"), prompt);
+});
+
+test("buildFitnessPrompt marks approval and uninstalled skills as not-flaggable but keeps their index", () => {
+	const workflow = {
+		name: "x",
+		description: "y",
+		steps: [
+			{ skill: "approval", prompt: "Sign off." },
+			{ skill: "made-up", prompt: "Do a thing." },
+			{ skill: "slack", prompt: "Post it." },
+		],
+	};
+	const prompt = buildFitnessPrompt(workflow as any, FITNESS_SKILLS);
+	assert.ok(prompt.includes("step 2:\n  skill: slack"), prompt);
+	assert.equal((prompt.match(/never flag this one/g) ?? []).length, 2, prompt);
+});
+
+test("parseFitnessResponse reads warnings and tolerates fences and prose", () => {
+	const steps = MISFIT_WORKFLOW.steps as any;
+	const expected = [{ stepIndex: 0, skill: "internal-comms", reason: "Announcements, not weather." }];
+	assert.deepEqual(parseFitnessResponse('[{"step":0,"reason":"Announcements, not weather."}]', steps), expected);
+	assert.deepEqual(
+		parseFitnessResponse('```json\n[{"step":0,"reason":"Announcements, not weather."}]\n```', steps),
+		expected,
+	);
+	assert.deepEqual(
+		parseFitnessResponse('Here you go:\n[{"step":0,"reason":"Announcements, not weather."}]\nHope that helps!', steps),
+		expected,
+	);
+});
+
+test("parseFitnessResponse degrades to no warnings rather than throwing", () => {
+	const steps = MISFIT_WORKFLOW.steps as any;
+	for (const raw of ["", "   ", "[]", "not json at all", "[{oops}]", '{"step":0,"reason":"x"}', "null"]) {
+		assert.deepEqual(parseFitnessResponse(raw, steps), [], `expected no warnings for ${JSON.stringify(raw)}`);
+	}
+});
+
+test("parseFitnessResponse drops out-of-range indices, blank reasons, and duplicates", () => {
+	const steps = MISFIT_WORKFLOW.steps as any;
+	const raw = JSON.stringify([
+		{ step: 9, reason: "points at a step that does not exist" },
+		{ step: -1, reason: "negative" },
+		{ step: 1.5, reason: "not an integer" },
+		{ step: 0, reason: "   " },
+		{ step: 1, reason: "first for this step" },
+		{ step: 1, reason: "duplicate for this step" },
+	]);
+	assert.deepEqual(parseFitnessResponse(raw, steps), [
+		{ stepIndex: 1, skill: "slack", reason: "first for this step" },
+	]);
+});
+
+test("checkSkillFitness flags a real-but-unsuited skill", async () => {
+	let seenPrompt = "";
+	const warnings = await checkSkillFitness({
+		workflow: MISFIT_WORKFLOW as any,
+		skills: FITNESS_SKILLS,
+		llm: async (messages) => {
+			seenPrompt = messages[messages.length - 1].content;
+			return '[{"step":0,"reason":"internal-comms publishes staff announcements; this step needs a weather report."}]';
+		},
+	});
+	assert.equal(warnings.length, 1);
+	assert.equal(warnings[0].stepIndex, 0);
+	assert.equal(warnings[0].skill, "internal-comms");
+	assert.ok(seenPrompt.includes("internal-comms"), seenPrompt);
+});
+
+test("checkSkillFitness skips the LLM when no step can be judged", async () => {
+	let called = 0;
+	const llm: LlmClient = async () => {
+		called++;
+		return "[]";
+	};
+	const base = { skills: FITNESS_SKILLS, llm };
+
+	// No installed skills at all — nothing to compare a step against.
+	assert.deepEqual(await checkSkillFitness({ ...base, skills: [], workflow: MISFIT_WORKFLOW as any }), []);
+	// Only approval and uninstalled skills.
+	assert.deepEqual(
+		await checkSkillFitness({
+			...base,
+			workflow: {
+				name: "x",
+				description: "y",
+				steps: [{ skill: "approval", prompt: "Sign off." }, { skill: "made-up", prompt: "Go." }],
+			} as any,
+		}),
+		[],
+	);
+	// No steps.
+	assert.deepEqual(await checkSkillFitness({ ...base, workflow: { name: "x", description: "y", steps: [] } as any }), []);
+	assert.equal(called, 0, "fitness check should not call the LLM when nothing is judgeable");
+});
+
+test("checkSkillFitness swallows a provider error — the check is advisory", async () => {
+	const warnings = await checkSkillFitness({
+		workflow: MISFIT_WORKFLOW as any,
+		skills: FITNESS_SKILLS,
+		llm: async () => {
+			throw new Error("429 rate limited");
+		},
+	});
+	assert.deepEqual(warnings, []);
+});
+
+test("runGenerate surfaces fitness warnings but still writes the workflow", async () => {
+	await withInstalledSkills(["gmail", "slack", "summarize"], async (dir) => {
+		const result = await runGenerate({
+			flags: { dir, prompt: "summarize emails and post to Slack", dryRun: false },
+			llm: async () => VALID_YAML,
+			fitnessLlm: async () => '[{"step":2,"reason":"slack posts to a channel; this step asked for an email."}]',
+		});
+		assert.equal(result.fitnessWarnings.length, 1);
+		assert.equal(result.fitnessWarnings[0].stepIndex, 2);
+		assert.equal(result.fitnessWarnings[0].skill, "slack");
+		// A weak fit is a warning, not a validation error — the file is still written.
+		assert.ok(result.filePath, "expected the workflow to be written despite the warning");
+		const written = await readFile(result.filePath!, "utf-8");
+		assert.ok(written.includes("name: morning-digest"));
+	});
+});
+
+test("runGenerate --no-fitness-check skips the advisory pass", async () => {
+	await withInstalledSkills(["gmail", "slack", "summarize"], async (dir) => {
+		let fitnessCalls = 0;
+		const result = await runGenerate({
+			flags: { dir, prompt: "x", dryRun: true, fitnessCheck: false },
+			llm: async () => VALID_YAML,
+			fitnessLlm: async () => {
+				fitnessCalls++;
+				return '[{"step":0,"reason":"should never be reported"}]';
+			},
+		});
+		assert.equal(fitnessCalls, 0);
+		assert.deepEqual(result.fitnessWarnings, []);
 	});
 });
 

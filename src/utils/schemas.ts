@@ -234,6 +234,45 @@ export function validateSkillReferences(workflow: WorkflowDef, installedSkills: 
 	return errors;
 }
 
+/**
+ * Detects the "nothing installed covers this" response the generator's system
+ * prompt allows the model to return instead of a workflow:
+ *
+ *   unsupported:
+ *     - fetch the current weather forecast
+ *     - send a text message
+ *
+ * Without this escape hatch the installed-skill check pushes the model into
+ * picking whichever real skill happens to validate, producing a workflow that
+ * passes every check and then does the wrong thing at run time. Callers must
+ * check this *before* validateWorkflow — an `unsupported` document is not a
+ * workflow, so the schema would reject it as an unknown property and the
+ * resulting retry would just re-apply that same pressure.
+ *
+ * Returns the non-empty trimmed items, or null when the document is not a
+ * decline (including `unsupported: []`, which says nothing and is left to fail
+ * schema validation normally).
+ */
+export function parseUnsupportedReport(yamlText: string): string[] | null {
+	let parsed: unknown;
+	try {
+		parsed = yaml.load(yamlText);
+	} catch {
+		return null;
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+	const raw = (parsed as any).unsupported;
+	if (raw === undefined || raw === null) return null;
+	const items = (Array.isArray(raw) ? raw : [raw])
+		.map((v) => {
+			if (typeof v === "string") return v.trim();
+			if (typeof v === "number" || typeof v === "boolean") return String(v);
+			return "";
+		})
+		.filter((v) => v.length > 0);
+	return items.length > 0 ? items : null;
+}
+
 export function validateWorkflow(yamlText: string): ValidationResult {
 	let parsed: unknown;
 	try {

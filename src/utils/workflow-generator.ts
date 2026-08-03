@@ -25,14 +25,22 @@ export interface GenerateWorkflowOptions {
 	llm?: LlmClient;
 }
 
-const DEFAULT_MODEL = "openai:gpt-4o";
+export const DEFAULT_MODEL = "openai:gpt-4o";
 
 const SYSTEM_RULES = `Rules (MUST follow):
 - Output ONLY valid YAML. No markdown fences, no prose, no commentary before or after.
 - The output MUST validate against the schema above.
 - "name" must be kebab-case (lowercase letters, digits, and single hyphens).
 - Every step "skill" must reference an installed skill from the list below, unless the step is human approval — in that case use skill: "approval" and set requires_approval: true.
-- Never invent a skill name. Steps naming a skill that is not installed are rejected, so express the request using the installed skills even if that means fewer steps.
+- Never invent a skill name. Steps naming a skill that is not installed are rejected.
+- Do NOT satisfy that check by substituting a skill whose description does not actually cover the step's task. A workflow that validates but invokes the wrong skill is worse than no workflow, because nothing catches it before it runs.
+- When no installed skill plausibly covers part of the request, do not build a workflow at all. Instead output ONLY this shape, naming each uncovered capability in the user's own terms:
+
+unsupported:
+  - fetch the current weather forecast
+  - send a text message
+
+  Treat that as a last resort: whenever the installed skills do map onto the request, build the workflow.
 - When multiple steps need ordering beyond top-to-bottom, give them snake_case "id" values and use "depends_on" to express the dependency.
 - Keep "prompt" fields concrete and self-contained — a downstream agent will read them verbatim.
 - Do not invent fields not in the schema.`;
@@ -129,7 +137,7 @@ export function stripCodeFences(raw: string): string {
 	return m ? m[1].trim() : raw.trim();
 }
 
-async function defaultLlmClient(messages: LlmMessage[], opts: LlmCallOptions): Promise<string> {
+export async function defaultLlmClient(messages: LlmMessage[], opts: LlmCallOptions): Promise<string> {
 	const [providerRaw, ...modelParts] = opts.model.split(":");
 	const provider = providerRaw?.trim();
 	const modelId = modelParts.join(":").trim();

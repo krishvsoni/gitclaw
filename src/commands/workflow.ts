@@ -2,7 +2,8 @@ import { existsSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join, resolve, sep } from "path";
 import { discoverSkills } from "../skills.js";
-import { validateSkillReferences, validateWorkflow } from "../utils/schemas.js";
+import { parseUnsupportedReport, validateSkillReferences, validateWorkflow } from "../utils/schemas.js";
+import { checkSkillFitness, type FitnessWarning } from "../utils/skill-fitness.js";
 import { generateWorkflow, type LlmClient } from "../utils/workflow-generator.js";
 
 interface GenerateFlags {
@@ -14,9 +15,12 @@ interface GenerateFlags {
 	dryRun: boolean;
 	force?: boolean;
 	allowMissingSkills?: boolean;
+	/** Defaults to true; --no-fitness-check turns the advisory second pass off. */
+	fitnessCheck?: boolean;
 }
 
 const RED = (s: string) => `\x1b[31m${s}\x1b[0m`;
+const YELLOW = (s: string) => `\x1b[33m${s}\x1b[0m`;
 const GREEN = (s: string) => `\x1b[32m${s}\x1b[0m`;
 const DIM = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const BOLD = (s: string) => `\x1b[1m${s}\x1b[0m`;
@@ -43,6 +47,8 @@ Options:
                           Accept steps that reference skills which are not installed
                           (by default generation fails rather than writing a workflow
                           that cannot run)
+      --no-fitness-check  Skip the advisory pass that warns when a step's chosen skill
+                          looks unsuited to that step's task (saves one LLM call)
   -h, --help              Show this help message
 
 Examples:
@@ -96,6 +102,9 @@ function parseFlags(argv: string[]): GenerateFlags {
 			case "--allow-missing-skills":
 				flags.allowMissingSkills = true;
 				break;
+			case "--no-fitness-check":
+				flags.fitnessCheck = false;
+				break;
 			case "-h":
 			case "--help":
 				printHelp();
@@ -126,9 +135,46 @@ function slugify(name: string): string {
 export interface RunGenerateOptions {
 	flags: GenerateFlags;
 	llm?: LlmClient;
+	/** Client for the advisory fitness pass. Falls back to `llm`. */
+	fitnessLlm?: LlmClient;
 }
 
-export async function runGenerate(opts: RunGenerateOptions): Promise<{ filePath?: string; yaml: string; }> {
+export interface RunGenerateResult {
+	filePath?: string;
+	yaml: string;
+	fitnessWarnings: FitnessWarning[];
+}
+
+/**
+ * The model may answer with an `unsupported:` list instead of a workflow when
+ * nothing installed covers the request. Report it and stop — retrying would only
+ * push it back toward naming a real-but-unrelated skill, and there is no partial
+ * workflow worth writing.
+ */
+function reportUnsupported(items: string[], skillNames: string[]): void {
+	console.error(RED("\nNo installed skill covers part of this request:"));
+	for (const item of items) console.error(RED(`  - ${item}`));
+	console.error(DIM(`\nInstalled skills: ${skillNames.join(", ") || "(none)"}`));
+	console.error(
+		DIM(
+			"Add a skill for each item above under skills/, or re-word the request in terms of the installed skills.",
+		),
+	);
+}
+
+function reportFitnessWarnings(warnings: FitnessWarning[], steps: { skill?: string; prompt?: string }[]): void {
+	console.error(YELLOW(`\n${warnings.length} step(s) may use the wrong skill for the task:`));
+	for (const w of warnings) {
+		const prompt = steps[w.stepIndex]?.prompt ?? "";
+		console.error(YELLOW(`  step ${w.stepIndex + 1} — skill "${w.skill}": ${w.reason}`));
+		if (prompt) console.error(DIM(`    step prompt: ${prompt}`));
+	}
+	console.error(
+		DIM("\nThese are warnings, not errors — review the steps above, or pass --no-fitness-check to skip this pass."),
+	);
+}
+
+export async function runGenerate(opts: RunGenerateOptions): Promise<RunGenerateResult> {
 	const { flags } = opts;
 	if (!flags.prompt || !flags.prompt.trim()) {
 		throw new Error("--prompt is required");
@@ -164,6 +210,15 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<{ filePath?
 			apiKey: flags.apiKey,
 			llm: opts.llm,
 		});
+		// Checked before schema validation: an `unsupported:` document is not a
+		// workflow, so the schema would reject it as an unknown property and the
+		// retry would re-apply the very pressure the escape hatch exists to relieve.
+		const unsupported = parseUnsupportedReport(yaml);
+		if (unsupported) {
+			reportUnsupported(unsupported, skillNames);
+			throw new Error("No installed skill covers part of the request");
+		}
+
 		const result = validateWorkflow(yaml);
 		// A schema-valid workflow can still name skills that aren't installed,
 		// which would only surface as a run-time failure. Fold that into the same
@@ -178,8 +233,9 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<{ filePath?
 		lastErrors = [...result.errors, ...skillErrors];
 		if (attempt < MAX_RETRIES) {
 			promptForLlm =
-				`${flags.prompt.trim()}\n\nThe previous attempt failed schema validation or referenced skills that are not installed. Fix these errors and return the full YAML again:\n` +
-				lastErrors.map((e) => `- ${e}`).join("\n");
+				`${flags.prompt.trim()}\n\nThe previous attempt was rejected — it failed schema validation or named skills that are not installed:\n` +
+				lastErrors.map((e) => `- ${e}`).join("\n") +
+				"\n\nReturn the full corrected workflow as YAML. Being correct matters more than passing the check: do NOT swap in a skill whose description does not cover that step's task just to satisfy the installed-skill list. If no installed skill covers part of the request, return the unsupported: form instead.";
 		}
 	}
 
@@ -199,13 +255,28 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<{ filePath?
 		throw new Error("Validation failed after retries");
 	}
 
-	if (flags.dryRun) {
-		process.stdout.write(yaml.endsWith("\n") ? yaml : yaml + "\n");
-		return { yaml };
+	const validated = validateWorkflow(yaml).data!;
+
+	// Existence of a skill is now guaranteed; suitability is not. Warn (never fail)
+	// when a step's skill looks unrelated to what the step asks for, so a workflow
+	// that validates cleanly but would misfire at run time is not silently written.
+	let fitnessWarnings: FitnessWarning[] = [];
+	if (flags.fitnessCheck !== false) {
+		fitnessWarnings = await checkSkillFitness({
+			workflow: validated,
+			skills,
+			model: flags.model,
+			apiKey: flags.apiKey,
+			llm: opts.fitnessLlm ?? opts.llm,
+		});
+		if (fitnessWarnings.length > 0) reportFitnessWarnings(fitnessWarnings, validated.steps ?? []);
 	}
 
-	// Parse the validated YAML to get the workflow name for the file path.
-	const validated = validateWorkflow(yaml).data!;
+	if (flags.dryRun) {
+		process.stdout.write(yaml.endsWith("\n") ? yaml : yaml + "\n");
+		return { yaml, fitnessWarnings };
+	}
+
 	const slug = slugify(validated.name);
 	const workflowsDir = join(agentDir, "workflows");
 	const filePath = join(workflowsDir, `${slug}.yaml`);
@@ -217,7 +288,7 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<{ filePath?
 	await mkdir(workflowsDir, { recursive: true });
 	await writeFile(filePath, yaml.endsWith("\n") ? yaml : yaml + "\n", "utf-8");
 	console.error(GREEN(`\nWrote workflow to ${filePath}`));
-	return { filePath, yaml };
+	return { filePath, yaml, fitnessWarnings };
 }
 
 export async function handleWorkflowCommand(argv: string[]): Promise<void> {
