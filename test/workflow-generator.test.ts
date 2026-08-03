@@ -12,9 +12,11 @@ import {
 	buildSystemPrompt,
 	stripCodeFences,
 	generateWorkflow,
+	DEFAULT_MODEL,
 	type LlmClient,
 	type LlmMessage,
 } from "../src/utils/workflow-generator.ts";
+import { readPreferredModel } from "../src/utils/bootstrap.ts";
 import { runGenerate } from "../src/commands/workflow.ts";
 import { parseUnsupportedReport } from "../src/utils/schemas.ts";
 import {
@@ -609,6 +611,117 @@ test("runGenerate --no-fitness-check skips the advisory pass", async () => {
 		});
 		assert.equal(fitnessCalls, 0);
 		assert.deepEqual(result.fitnessWarnings, []);
+	});
+});
+
+// ── Model resolution (flag > agent.yaml model.preferred > default) ─────
+
+async function withAgentYaml(body: string | null, fn: (dir: string) => Promise<void>): Promise<void> {
+	const { mkdir, writeFile } = await import("node:fs/promises");
+	const dir = await mkdtemp(join(tmpdir(), "gitagent-model-"));
+	try {
+		// VALID_YAML names all three, so all three must be installed.
+		for (const name of ["gmail", "slack", "summarize"]) {
+			await mkdir(join(dir, "skills", name), { recursive: true });
+			await writeFile(
+				join(dir, "skills", name, "SKILL.md"),
+				`---\nname: ${name}\ndescription: Test skill ${name}\n---\n\nDo ${name} things.\n`,
+				"utf-8",
+			);
+		}
+		if (body !== null) await writeFile(join(dir, "agent.yaml"), body, "utf-8");
+		await fn(dir);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+}
+
+const AGENT_YAML = `spec_version: "1.0"
+name: test-agent
+version: 0.0.1
+description: Test agent
+model:
+  preferred: "anthropic:claude-sonnet-4-6"
+  fallback: []
+tools: []
+runtime:
+  max_turns: 10
+`;
+
+// Captures the model spec the LLM client is actually invoked with.
+function modelCapturingLlm(seen: { model?: string }): LlmClient {
+	return async (_messages, opts) => {
+		seen.model = opts.model;
+		return VALID_YAML;
+	};
+}
+
+test("readPreferredModel reads model.preferred, and tolerates a missing or broken agent.yaml", async () => {
+	await withAgentYaml(AGENT_YAML, async (dir) => {
+		assert.equal(await readPreferredModel(dir), "anthropic:claude-sonnet-4-6");
+	});
+	await withAgentYaml(null, async (dir) => {
+		assert.equal(await readPreferredModel(dir), undefined);
+	});
+	await withAgentYaml("model:\n  preferred: [not, a, string]\n", async (dir) => {
+		assert.equal(await readPreferredModel(dir), undefined);
+	});
+	await withAgentYaml("::: not yaml :::\n  - [\n", async (dir) => {
+		assert.equal(await readPreferredModel(dir), undefined);
+	});
+	await withAgentYaml("name: x\n", async (dir) => {
+		assert.equal(await readPreferredModel(dir), undefined);
+	});
+});
+
+test("runGenerate uses agent.yaml model.preferred when no --model is passed", async () => {
+	await withAgentYaml(AGENT_YAML, async (dir) => {
+		const seen: { model?: string } = {};
+		await runGenerate({
+			flags: { dir, prompt: "x", dryRun: true },
+			llm: modelCapturingLlm(seen),
+			fitnessLlm: async () => "[]",
+		});
+		assert.equal(seen.model, "anthropic:claude-sonnet-4-6");
+	});
+});
+
+test("runGenerate lets --model override agent.yaml", async () => {
+	await withAgentYaml(AGENT_YAML, async (dir) => {
+		const seen: { model?: string } = {};
+		await runGenerate({
+			flags: { dir, prompt: "x", dryRun: true, model: "openai:gpt-4o-mini" },
+			llm: modelCapturingLlm(seen),
+			fitnessLlm: async () => "[]",
+		});
+		assert.equal(seen.model, "openai:gpt-4o-mini");
+	});
+});
+
+test("runGenerate falls back to the built-in default with no flag and no agent.yaml", async () => {
+	await withAgentYaml(null, async (dir) => {
+		const seen: { model?: string } = {};
+		await runGenerate({
+			flags: { dir, prompt: "x", dryRun: true },
+			llm: modelCapturingLlm(seen),
+			fitnessLlm: async () => "[]",
+		});
+		assert.equal(seen.model, DEFAULT_MODEL);
+	});
+});
+
+test("the fitness pass runs on the same resolved model as generation", async () => {
+	await withAgentYaml(AGENT_YAML, async (dir) => {
+		let fitnessModel: string | undefined;
+		await runGenerate({
+			flags: { dir, prompt: "x", dryRun: true },
+			llm: async () => VALID_YAML,
+			fitnessLlm: async (_messages, opts) => {
+				fitnessModel = opts.model;
+				return "[]";
+			},
+		});
+		assert.equal(fitnessModel, "anthropic:claude-sonnet-4-6");
 	});
 });
 

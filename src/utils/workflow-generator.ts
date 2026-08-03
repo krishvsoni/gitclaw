@@ -1,4 +1,5 @@
 import type { SkillMetadata } from "../skills.js";
+import { recordGenAiCall } from "../telemetry.js";
 import { getWorkflowSchemaText } from "./schemas.js";
 
 export type LlmRole = "system" | "user" | "assistant";
@@ -181,11 +182,16 @@ export async function defaultLlmClient(messages: LlmMessage[], opts: LlmCallOpti
 	});
 
 	let collected = "";
+	// Every assistant message is reported so token/cost lands in telemetry. This
+	// client backs workflow generation, its retries, and the fitness pass, so all
+	// three are accounted for. recordGenAiCall is a no-op when telemetry is off.
+	const startedAt = Date.now();
 	agent.subscribe((event: any) => {
 		if (event.type === "message_end" && event.message?.role === "assistant") {
 			for (const block of event.message.content) {
 				if (block.type === "text") collected += block.text;
 			}
+			recordGenAiCall(event.message, { durationMs: Date.now() - startedAt });
 		}
 	});
 

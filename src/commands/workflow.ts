@@ -1,10 +1,13 @@
 import { existsSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join, resolve, sep } from "path";
+import { SpanStatusCode, context, trace } from "@opentelemetry/api";
 import { discoverSkills } from "../skills.js";
+import { getTracer } from "../telemetry.js";
+import { loadDotEnvFiles, maybeInitTelemetry, readPreferredModel } from "../utils/bootstrap.js";
 import { parseUnsupportedReport, validateSkillReferences, validateWorkflow } from "../utils/schemas.js";
 import { checkSkillFitness, type FitnessWarning } from "../utils/skill-fitness.js";
-import { generateWorkflow, type LlmClient } from "../utils/workflow-generator.js";
+import { DEFAULT_MODEL, generateWorkflow, type LlmClient } from "../utils/workflow-generator.js";
 
 interface GenerateFlags {
 	dir: string;
@@ -38,7 +41,8 @@ Options:
   -p, --prompt <text>     Natural-language description of the workflow (required)
       --refine <file>     Refine an existing workflow YAML by applying --prompt as an instruction
                           (must be a path inside the agent directory)
-  -m, --model <spec>      LLM model in provider:model form (default: openai:gpt-4o)
+  -m, --model <spec>      LLM model in provider:model form
+                          (default: agent.yaml's model.preferred, else openai:gpt-4o)
       --api-key <key>     API key for the provider (falls back to OPENAI_API_KEY or <PROVIDER>_API_KEY)
       --dry-run           Print the generated YAML to stdout instead of writing a file
   -f, --force             Overwrite workflows/<name>.yaml if it already exists
@@ -174,6 +178,16 @@ function reportFitnessWarnings(warnings: FitnessWarning[], steps: { skill?: stri
 	);
 }
 
+/**
+ * Model precedence: -m/--model, then agent.yaml's model.preferred, then the
+ * built-in default. Before this, the subcommand always used the built-in
+ * default, so an agent configured for one provider generated on another.
+ */
+async function resolveModel(flags: GenerateFlags, agentDir: string): Promise<string | undefined> {
+	if (flags.model) return flags.model;
+	return await readPreferredModel(agentDir);
+}
+
 export async function runGenerate(opts: RunGenerateOptions): Promise<RunGenerateResult> {
 	const { flags } = opts;
 	if (!flags.prompt || !flags.prompt.trim()) {
@@ -181,8 +195,67 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<RunGenerate
 	}
 
 	const agentDir = resolve(flags.dir);
+
+	// main() does this for the interactive path, but the workflow subcommand
+	// returns before reaching it, so it has to happen here too: provider keys and
+	// OTEL_* vars from .env, then telemetry, so generation is cost-tracked.
+	loadDotEnvFiles(agentDir);
+	await maybeInitTelemetry();
+
+	const model = await resolveModel(flags, agentDir);
+	console.error(DIM(`Model: ${model ?? DEFAULT_MODEL}`));
 	const skills = await discoverSkills(agentDir);
 	const skillNames = skills.map((s) => s.name);
+
+	const span = getTracer().startSpan("gitagent.workflow.generate", {
+		attributes: {
+			"gitagent.workflow.model": model ?? "(default)",
+			"gitagent.workflow.skills_installed": skills.length,
+			"gitagent.workflow.refine": Boolean(flags.refine),
+		},
+	});
+	try {
+		// context.with, not a bare await: the per-call gen_ai.chat spans read the
+		// active context to find their parent. Without it each LLM call becomes its
+		// own root trace and the cost of one generation cannot be summed.
+		const result = await context.with(trace.setSpan(context.active(), span), () =>
+			generateInner(opts, {
+				agentDir,
+				prompt: flags.prompt!.trim(),
+				model,
+				skills,
+				skillNames,
+			}),
+		);
+		span.setAttributes({
+			"gitagent.workflow.attempts": result.attempts,
+			"gitagent.workflow.fitness_warnings": result.fitnessWarnings.length,
+			"gitagent.workflow.written": Boolean(result.filePath),
+		});
+		return result;
+	} catch (err: any) {
+		span.setStatus({ code: SpanStatusCode.ERROR, message: String(err?.message ?? err).slice(0, 200) });
+		throw err;
+	} finally {
+		span.end();
+	}
+}
+
+interface GenerateContext {
+	agentDir: string;
+	/** Trimmed and validated in runGenerate. */
+	prompt: string;
+	model?: string;
+	skills: Awaited<ReturnType<typeof discoverSkills>>;
+	skillNames: string[];
+}
+
+async function generateInner(
+	opts: RunGenerateOptions,
+	ctx: GenerateContext,
+): Promise<RunGenerateResult & { attempts: number }> {
+	const { flags } = opts;
+	const { agentDir, prompt, model, skills, skillNames } = ctx;
 
 	let previousWorkflow: string | undefined;
 	if (flags.refine) {
@@ -196,17 +269,19 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<RunGenerate
 		previousWorkflow = await readFile(refinePath, "utf-8");
 	}
 
-	let promptForLlm = flags.prompt.trim();
+	let promptForLlm = prompt;
 	let lastErrors: string[] = [];
 	let yaml = "";
+	let attempts = 0;
 
 	for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
 		console.error(DIM(attempt === 0 ? "Generating workflow..." : `Retry ${attempt}/${MAX_RETRIES} — fixing validation errors...`));
+		attempts++;
 		yaml = await generateWorkflow({
 			prompt: promptForLlm,
 			skills,
 			previousWorkflow,
-			model: flags.model,
+			model,
 			apiKey: flags.apiKey,
 			llm: opts.llm,
 		});
@@ -233,7 +308,7 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<RunGenerate
 		lastErrors = [...result.errors, ...skillErrors];
 		if (attempt < MAX_RETRIES) {
 			promptForLlm =
-				`${flags.prompt.trim()}\n\nThe previous attempt was rejected — it failed schema validation or named skills that are not installed:\n` +
+				`${prompt}\n\nThe previous attempt was rejected — it failed schema validation or named skills that are not installed:\n` +
 				lastErrors.map((e) => `- ${e}`).join("\n") +
 				"\n\nReturn the full corrected workflow as YAML. Being correct matters more than passing the check: do NOT swap in a skill whose description does not cover that step's task just to satisfy the installed-skill list. If no installed skill covers part of the request, return the unsupported: form instead.";
 		}
@@ -265,7 +340,7 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<RunGenerate
 		fitnessWarnings = await checkSkillFitness({
 			workflow: validated,
 			skills,
-			model: flags.model,
+			model,
 			apiKey: flags.apiKey,
 			llm: opts.fitnessLlm ?? opts.llm,
 		});
@@ -274,7 +349,7 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<RunGenerate
 
 	if (flags.dryRun) {
 		process.stdout.write(yaml.endsWith("\n") ? yaml : yaml + "\n");
-		return { yaml, fitnessWarnings };
+		return { yaml, fitnessWarnings, attempts };
 	}
 
 	const slug = slugify(validated.name);
@@ -288,7 +363,7 @@ export async function runGenerate(opts: RunGenerateOptions): Promise<RunGenerate
 	await mkdir(workflowsDir, { recursive: true });
 	await writeFile(filePath, yaml.endsWith("\n") ? yaml : yaml + "\n", "utf-8");
 	console.error(GREEN(`\nWrote workflow to ${filePath}`));
-	return { filePath, yaml, fitnessWarnings };
+	return { filePath, yaml, fitnessWarnings, attempts };
 }
 
 export async function handleWorkflowCommand(argv: string[]): Promise<void> {
